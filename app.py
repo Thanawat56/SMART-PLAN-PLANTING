@@ -3,6 +3,7 @@ import os
 import warnings
 import sqlite3
 import html
+import hashlib
 from datetime import datetime
 
 import ui
@@ -115,39 +116,127 @@ def render_chat_history(messages):
         role = message.get("role", "assistant")
         render_chat_content(role, message.get("content", ""))
 
+
+def format_source_from_metadata(metadata: dict) -> str:
+    if not metadata:
+        return "Unknown"
+
+    source = metadata.get("source") or "Unknown"
+    details = []
+
+    if metadata.get("page") is not None:
+        details.append(f"page={metadata['page']}")
+    if metadata.get("row") is not None:
+        details.append(f"row={metadata['row']}")
+    if metadata.get("sheet") is not None:
+        details.append(f"sheet={metadata['sheet']}")
+    if metadata.get("chunk") is not None:
+        details.append(f"chunk={metadata['chunk']}")
+
+    if details:
+        return f"{source} ({', '.join(details)})"
+    return source
+
 # --- 4. ฟังก์ชันเตรียมฐานข้อมูล RAG (LangChain) ---
-@st.cache_resource
-def init_rag_bot():
-    data_path = "./data"
+def _load_documents_from_data(data_path: str):
     all_docs = []
     if not os.path.exists(data_path) or not os.listdir(data_path):
-        return None
+        return all_docs
 
     # โหลดไฟล์ทุกประเภทจากโฟลเดอร์ data
     for file in os.listdir(data_path):
         full_path = os.path.join(data_path, file)
         ext = os.path.splitext(file)[1].lower()
         try:
-            if ext == ".pdf": loader = PDFPlumberLoader(full_path)
-            elif ext == ".csv": loader = CSVLoader(file_path=full_path, encoding='utf-8')
-            elif ext == ".docx": loader = Docx2txtLoader(full_path)
-            elif ext == ".txt": loader = TextLoader(full_path, encoding='utf-8')
-            else: continue
+            if ext == ".pdf":
+                loader = PDFPlumberLoader(full_path)
+            elif ext == ".csv":
+                loader = CSVLoader(file_path=full_path, encoding="utf-8")
+            elif ext == ".docx":
+                loader = Docx2txtLoader(full_path)
+            elif ext == ".txt":
+                loader = TextLoader(full_path, encoding="utf-8")
+            else:
+                continue
             all_docs.extend(loader.load())
         except Exception as e:
             st.error(f"ไม่สามารถโหลดไฟล์ {file} ได้: {e}")
+    return all_docs
 
-    if not all_docs: return None
+
+def _build_data_fingerprint(data_path: str) -> str:
+    files = []
+    for file in sorted(os.listdir(data_path)):
+        full_path = os.path.join(data_path, file)
+        if not os.path.isfile(full_path):
+            continue
+        stat = os.stat(full_path)
+        files.append(f"{file}:{stat.st_mtime_ns}:{stat.st_size}")
+    return hashlib.md5("|".join(files).encode("utf-8")).hexdigest()
+
+
+def _vectorize_documents(data_path: str):
+    all_docs = _load_documents_from_data(data_path)
+    if not all_docs:
+        return None
 
     # หั่นข้อความ (Chunking) เพื่อให้ AI ค้นหาข้อมูลได้แม่นยำ
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
     split_docs = text_splitter.split_documents(all_docs)
+    if not split_docs:
+        return None
 
-    # สร้าง Vector Database (FAISS) และ Embedding (E5)
+    # Vectorize: แปลงแต่ละ chunk เป็น embedding แล้วสร้าง FAISS index
     embeddings = HuggingFaceEmbeddings(model_name="intfloat/multilingual-e5-base")
-    vectorstore = FAISS.from_documents(split_docs, embeddings)
+    return FAISS.from_documents(split_docs, embeddings)
+
+
+@st.cache_resource
+def init_rag_bot():
+    data_path = "./data"
+    index_root = "./vectorstore"
+    if not os.path.exists(data_path) or not os.listdir(data_path):
+        return None
+
+    os.makedirs(index_root, exist_ok=True)
+    data_fingerprint = _build_data_fingerprint(data_path)
+    index_path = os.path.join(index_root, data_fingerprint)
+
+    embeddings = HuggingFaceEmbeddings(model_name="intfloat/multilingual-e5-base")
+
+    # ถ้ามี index เดิมให้โหลดทันที ไม่ต้อง vectorize ใหม่
+    if os.path.exists(index_path):
+        vectorstore = FAISS.load_local(
+            index_path,
+            embeddings,
+            allow_dangerous_deserialization=True
+        )
+        return vectorstore.as_retriever(search_kwargs={"k": 5})
+
+    vectorstore = _vectorize_documents(data_path)
+    if vectorstore is None:
+        return None
+
+    # บันทึก index ไว้ใช้รอบถัดไป
+    vectorstore.save_local(index_path)
     # ค้นหาข้อมูลที่ใกล้เคียงที่สุด 5 ส่วน (k=5)
     return vectorstore.as_retriever(search_kwargs={"k": 5})
+
+
+import requests
+
+def get_weather(city="Bangkok"):
+    api_key = os.getenv("OPENWEATHER_API_KEY")
+    url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric"
+    
+    res = requests.get(url)
+    data = res.json()
+    
+    return {
+            "temp": data["main"]["temp"],
+            "humidity": data["main"]["humidity"],
+            "weather": data["weather"][0]["description"]
+    }
 
 # --- 5. UI Layout ---
 # --- 5. UI Layout ---
@@ -263,7 +352,7 @@ st.divider()
 # เรียกใช้งาน Bot
 retriever = init_rag_bot()
 llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=os.getenv("GROQ_API_KEY"))
-
+weather_data = get_weather("Bangkok")
 if retriever is None:
     st.info("📌 กรุณานำไฟล์ข้อมูลไปวางในโฟลเดอร์ `data` และ Refresh หน้าจอ")
 else:
@@ -309,9 +398,12 @@ else:
                     5. ตอบคำถามด้วยภาษาที่เป็นธรรมชาติ สรุปใจความสำคัญ และให้คำแนะนำที่ชัดเจน 
                     6. ตอบคำถาม ขั้นตอนการปลูก การดูแล และการเก็บเกี่ยวให้ครบถ้วน หากข้อมูลในไฟล์ไม่ครบ ให้ตอบตามข้อมูลที่มีและบอกว่าข้อมูลไม่ครบ
 
+                
                     [ประวัติการสนทนา]
                     {history}
 
+                    [ข้อมูลสภาพอากาศปัจจุบัน]
+                    {weather}
                     [ข้อมูลอ้างอิงจากไฟล์]
                     {context}
                     
@@ -321,7 +413,7 @@ else:
                 )
                 
                 # 6. ส่งข้อมูลเข้า LLM
-                chain_input = prompt.format(history=history_text, context=context_text, question=query)
+                chain_input = prompt.format(history=history_text, weather=weather_data,context=context_text, question=query)
                 response = llm.invoke(chain_input)
                 
                 # 7. แสดงผลและบันทึกคำตอบ Bot
@@ -332,7 +424,8 @@ else:
                 # แสดงแหล่งที่มาของข้อมูล
                 with st.expander("🔍 ดูแหล่งที่มา"):
                     for i, doc in enumerate(context_docs):
-                        st.write(f"📄 ส่วนที่ {i+1}: {doc.metadata.get('source', 'Unknown')}")
+                        source_text = format_source_from_metadata(doc.metadata)
+                        st.write(f"📄 ส่วนที่ {i+1}: {source_text}")
 
 # 🟢 Empty State
 if not st.session_state.messages:
