@@ -1,0 +1,7 @@
+# Local env files
+.env
+.env.local
+.env.*.local
+
+# กรณีต้องการยกเว้นไฟล์ .env ทั้งหมดในทุกโฟลเดอร์
+**/.env
